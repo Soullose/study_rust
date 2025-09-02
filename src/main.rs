@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
     let devices = vec![
         ("127.0.0.1:502".parse().unwrap(), 1, 1 as u64),
         ("127.0.0.1:503".parse().unwrap(), 1, 2 as u64),
-        ("127.0.0.1:504".parse().unwrap(), 1, 1 as u64),
+        ("127.0.0.1:505".parse().unwrap(), 1, 1 as u64),
         ("127.0.0.1:506".parse().unwrap(), 1, 2 as u64),
         // 可以添加更多设备
     ];
