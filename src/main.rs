@@ -1,34 +1,23 @@
 // src/main.rs
 mod modbus_client;
-use crate::modbus_client::run_modbus_client;
+use crate::modbus_client::run_modbus_client_tcp;
 use anyhow::Result;
-use futures::future::try_join_all;
+use std::net::SocketAddr;
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 定义要连接的设备列表 (地址, Slave ID)
-    let devices = vec![
-        ("127.0.0.1:502".parse().unwrap(), 1, 1 as u64),
-        // ("127.0.0.1:503".parse().unwrap(), 1, 2 as u64),
-        // ("127.0.0.1:505".parse().unwrap(), 1, 1 as u64),
-        // ("127.0.0.1:506".parse().unwrap(), 1, 2 as u64),
-        // 可以添加更多设备
-    ];
-    // 为每个设备创建一个异步任务
-    let tasks: Vec<_> = devices
-        .into_iter()
-        .map(|(addr, slave_id, read_interval_secs)| tokio::spawn(run_modbus_client(addr, slave_id, read_interval_secs)))
-        .collect();
+    // 示例：连接到本地主机的 Modbus TCP（端口 502），Slave ID = 1，每 2 秒读取一次
+    let addr: SocketAddr = "127.0.0.1:502".parse().unwrap();
+    let handle = run_modbus_client_tcp(addr, 1, 2);
 
-    // 等待所有任务完成
-    match try_join_all(tasks).await {
-        Ok(_) => println!("所有连接已正常结束"),
-        Err(e) => eprintln!("有连接异常结束: {:?}", e),
-    }
-    // // 创建 tokio 运行时并执行异步函数
-    // let rt = tokio::runtime::Runtime::new()?;
-    // // 设置 Modbus 服务器地址和端口
-    // let socket_addr = "127.0.0.1:502".parse().unwrap();
-    // rt.block_on(run_modbus_client(socket_addr, 1))?;
+    println!("Modbus client started. Running for 10s...");
+    // 运行一段时间后停止（示例中 10 秒）
+    sleep(Duration::from_secs(10)).await;
+
+    println!("Stopping Modbus client...");
+    handle.stop_and_wait().await?;
+    println!("Modbus client stopped.");
+
     Ok(())
 }

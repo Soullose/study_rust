@@ -2,104 +2,111 @@ use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, interval};
 use tokio_modbus::prelude::*;
-pub async fn run_modbus_client(socket_addr: SocketAddr, slave_id: u8, read_interval_secs: u64) -> Result<()> {
-    // 设置读取间隔（秒）
-    let mut interval = interval(Duration::from_secs(read_interval_secs));
 
-    // 用于控制循环的原子布尔值
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
+pub struct ModbusHandle {
+    pub join: JoinHandle<Result<()>>,
+    stop_flag: Arc<AtomicBool>,
+}
 
-    // 设置 Ctrl+C 信号处理
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
-        println!("接收到停止信号，正在停止...");
-        r.store(false, Ordering::SeqCst);
-    });
-
-    println!("开始周期性读取，间隔: {} 秒", read_interval_secs);
-    println!("按 Ctrl+C 停止读取");
-
-    // 读取计数器
-    let mut read_count = 0;
-
-    // 重连配置
-    let max_reconnect_attempts = 5; // 最大重连尝试次数
-    let reconnect_interval = Duration::from_secs(5); // 重连间隔
-
-    // 主循环
-    while running.load(Ordering::SeqCst) {
-        interval.tick().await;
-
-        // 尝试连接或重连
-        let mut ctx = match tcp::connect_slave(socket_addr, Slave(slave_id)).await {
-            Ok(ctx) => {
-                println!("成功连接到 Modbus 服务器: {}", socket_addr);
-                ctx
-            }
-            Err(e) => {
-                eprintln!("连接失败: {}, 尝试重连...", e);
-
-                // 重连逻辑
-                let mut attempts = 0;
-                let mut connected = false;
-                let mut new_ctx = None;
-
-                while attempts < max_reconnect_attempts && running.load(Ordering::SeqCst) {
-                    attempts += 1;
-                    println!("第 {} 次重连尝试...", attempts);
-
-                    tokio::time::sleep(reconnect_interval).await;
-
-                    match tcp::connect_slave(socket_addr, Slave(slave_id)).await {
-                        Ok(ctx) => {
-                            println!("重连成功!");
-                            new_ctx = Some(ctx);
-                            connected = true;
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("重连失败: {}", e);
-                        }
-                    }
-                }
-
-                if !connected {
-                    eprintln!("达到最大重连次数，停止尝试");
-                    break;
-                }
-
-                new_ctx.unwrap()
-            }
-        };
-
-        read_count += 1;
-        println!("\n第 {} 次读取:", read_count);
-
-        // 读取保持寄存器
-        let start_address = 0;
-        let register_count = 5;
-
-        match ctx.read_holding_registers(start_address, register_count).await {
-            Ok(registers) => {
-                println!("成功读取寄存器:");
-                for (i, value) in registers.iter().enumerate() {
-                    println!("寄存器 {}: {:?}", start_address + i as u16, value);
-                }
-
-                // 如果读取成功，继续使用当前连接进行下一次读取
-                drop(ctx); // 显式释放连接，下次循环会重新建立
-            }
-            Err(e) => {
-                eprintln!("读取寄存器失败: {}", e);
-                // 读取失败，连接可能已断开，下次循环会尝试重连
-                drop(ctx); // 释放当前连接
-            }
-        }
+impl ModbusHandle {
+    pub fn stop(&self) {
+        self.stop_flag.store(false, Ordering::SeqCst);
     }
 
-    println!("连接已关闭");
-    Ok(())
+    pub async fn stop_and_wait(self) -> Result<()> {
+        self.stop();
+        self.join.await.unwrap_or_else(|e| Err(anyhow::anyhow!(e.to_string())))
+    }
+}
+
+// 移除泛型 runner，使用 TCP 专用实现以避免类型推断复杂性
+pub fn run_modbus_client_tcp(socket_addr: SocketAddr, slave_id: u8, read_interval_secs: u64) -> ModbusHandle {
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_flag = running.clone();
+
+    let join = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(read_interval_secs));
+        println!("开始周期性读取，间隔: {} 秒", read_interval_secs);
+        println!("按 Ctrl+C 停止读取");
+
+        // Ctrl+C 也可以设置停止标志
+        let r = running.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("接收到停止信号，正在停止...");
+            r.store(false, Ordering::SeqCst);
+        });
+
+        let mut read_count: usize = 0;
+        let max_reconnect_attempts = 5usize;
+        let reconnect_interval = Duration::from_secs(5);
+
+        while running.load(Ordering::SeqCst) {
+            interval.tick().await;
+
+            // 建立连接（含重连逻辑）
+            let mut attempts = 0usize;
+            let mut ctx_res: anyhow::Result<tokio_modbus::client::Context> = tcp::connect_slave(socket_addr, Slave(slave_id))
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()));
+
+            while ctx_res.is_err() && attempts < max_reconnect_attempts && running.load(Ordering::SeqCst) {
+                attempts += 1;
+                eprintln!("连接失败，正在尝试第 {} 次重连...", attempts);
+                tokio::time::sleep(reconnect_interval).await;
+                ctx_res = tcp::connect_slave(socket_addr, Slave(slave_id))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()));
+            }
+
+            let mut ctx = match ctx_res {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("达到最大重连次数，跳过本次读取: {}", e);
+                    continue;
+                }
+            };
+
+            read_count += 1;
+            println!("\n第 {} 次读取:", read_count);
+
+            let start_address: u16 = 0;
+            let register_count: u16 = 5;
+
+            match ctx.read_holding_registers(start_address, register_count).await {
+                Ok(registers) => {
+                    println!("成功读取寄存器:");
+                    for (i, value) in registers.iter().enumerate() {
+                        println!("寄存器 {}: {:?}", start_address + i as u16, value);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("读取寄存器失败: {}", e);
+                }
+            }
+
+            // 明确 drop 连接以关闭 socket
+            drop(ctx);
+        }
+
+        println!("读取循环已退出，连接已关闭");
+        Ok(())
+    });
+
+    ModbusHandle { join, stop_flag }
+}
+
+// 保留测试入口
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn smoke_tcp_runner() {
+        let _ = run_modbus_client_tcp(SocketAddr::from_str("127.0.0.1:502").unwrap(), 1, 1);
+    }
 }
